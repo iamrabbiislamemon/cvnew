@@ -1,6 +1,8 @@
-"""Camera abstraction. Everything downstream only calls read()/release(), so a Raspberry Pi
-camera can be added later as another CameraSource subclass without touching the rest."""
+"""Camera abstraction. Everything downstream only calls read()/release(), so the laptop webcam, a
+Raspberry Pi camera and the simulated cameras are interchangeable. open_camera() picks the live one."""
+import logging
 import math
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence, Tuple
@@ -10,6 +12,8 @@ import numpy as np
 from cv2 import aruco
 
 from aruco.detector import SUPPORTED_DICTIONARIES
+
+log = logging.getLogger("warehouse")
 
 
 class CameraError(Exception):
@@ -42,6 +46,171 @@ class WebcamSource(CameraSource):
 
     def release(self) -> None:
         self._cap.release()
+
+
+class PiCameraSource(CameraSource):
+    """Raspberry Pi ribbon-cable camera (Camera Module 2/3, HQ camera, ...) through Picamera2.
+
+    On a Pi 5 these cameras are driven by libcamera and are not ordinary webcams, so cv2.VideoCapture
+    cannot open them. Frames come out as BGR, exactly like WebcamSource's, so nothing downstream changes.
+    """
+    # 16:9 uses the full sensor width of a Camera Module 3 (a 4:3 size would crop the field of view),
+    # and gives a 5 cm product marker enough pixels at arm's length.
+    DEFAULT_SIZE = (1280, 720)
+
+    def __init__(self, index: int = 0, width: Optional[int] = None, height: Optional[int] = None):
+        cameras = list_pi_cameras()
+        if not 0 <= index < len(cameras):
+            raise CameraError("No Raspberry Pi camera {} ({} connected). Check the ribbon cable, then run "
+                              "'rpicam-hello --list-cameras'.".format(index, len(cameras)))
+        picamera2, controls = _load_picamera2()
+        camera_num, info = cameras[index]
+        size = (width or self.DEFAULT_SIZE[0], height or self.DEFAULT_SIZE[1])
+        try:
+            self._cam = picamera2(camera_num)
+        except (RuntimeError, OSError, IndexError) as e:
+            raise CameraError("Cannot open Raspberry Pi camera {} ({}): {}. Close any other program using it "
+                              "(rpicam-hello, another main.py).".format(index, info.get("Model", "?"), e))
+        try:
+            # libcamera's "RGB888" is stored B, G, R: already OpenCV's BGR order, no conversion needed.
+            config = {"main": {"size": size, "format": "RGB888"}}
+            sensor = _full_view_sensor_mode(self._cam, size)
+            if sensor is not None:
+                config["sensor"] = sensor
+            self._cam.configure(self._cam.create_video_configuration(**config))
+            self._cam.start()
+            # Camera Module 3 has autofocus: keep it on so markers stay sharp from arm's length to the wall.
+            if "AfMode" in self._cam.camera_controls:
+                self._cam.set_controls({"AfMode": controls.AfModeEnum.Continuous})
+        except (RuntimeError, OSError, ValueError) as e:
+            self._cam.close()
+            raise CameraError("Cannot start Raspberry Pi camera {}: {}".format(index, e))
+        width, height = self._cam.camera_configuration()["main"]["size"]
+        log.info("Camera: Raspberry Pi camera %d (%s) at %dx%d%s", index, info.get("Model", "?"), width, height,
+                 ", sensor mode {}x{}".format(*sensor["output_size"]) if sensor else "")
+
+    def read(self) -> Optional[np.ndarray]:
+        try:
+            frame = self._cam.capture_array("main")
+        except RuntimeError:
+            return None
+        # Picamera2 can hand back a strided view; OpenCV's drawing calls need a plain contiguous image.
+        return np.ascontiguousarray(frame)
+
+    def release(self) -> None:
+        if self._cam is not None:
+            self._cam.close()       # also stops the camera, freeing it for the next program
+            self._cam = None
+
+
+def _full_view_sensor_mode(cam, size: Tuple[int, int]) -> Optional[dict]:
+    """The sensor mode that sees the whole sensor, with the fewest pixels that still cover `size`.
+
+    Left to itself libcamera picks the mode closest to the output size, which on a Camera Module 3 at
+    1280x720 is a centre crop showing about 2/3 of the view, so shelf markers near the edge are missed.
+    None (libcamera chooses) if the camera does not describe its modes.
+    """
+    try:
+        modes = [(tuple(m["size"]), m["bit_depth"], m["crop_limits"][2] * m["crop_limits"][3])
+                 for m in cam.sensor_modes]
+    except (KeyError, TypeError, IndexError, RuntimeError):
+        return None
+    if not modes:
+        return None
+    widest = max(view for _, _, view in modes)
+    full_view = [(mode_size, depth) for mode_size, depth, view in modes if view >= widest]
+    big_enough = [m for m in full_view if m[0][0] >= size[0] and m[0][1] >= size[1]]
+    area = lambda m: m[0][0] * m[0][1]                                   # noqa: E731
+    mode_size, bit_depth = min(big_enough, key=area) if big_enough else max(full_view, key=area)
+    return {"output_size": mode_size, "bit_depth": bit_depth}
+
+
+def _load_picamera2():
+    """(Picamera2, libcamera.controls), imported only when a Pi camera is actually wanted."""
+    os.environ.setdefault("LIBCAMERA_LOG_LEVELS", "*:WARN")     # libcamera's INFO lines flood the console
+    try:
+        from picamera2 import Picamera2
+        from libcamera import controls
+    except ImportError as e:
+        raise CameraError("Picamera2 is not available ({}). On the Pi: sudo apt install python3-picamera2 and "
+                          "use a venv made with --system-site-packages (bash pi_setup.sh does both).".format(e))
+    except ValueError as e:
+        # "numpy.dtype size changed": a pip numpy in the venv replaced the one Picamera2 was built against.
+        raise CameraError("Picamera2 cannot load with this numpy ({}). Re-run bash pi_setup.sh, which keeps "
+                          "the system numpy.".format(e))
+    logging.getLogger("picamera2").setLevel(logging.WARNING)
+    return Picamera2, controls
+
+
+def list_pi_cameras() -> List[Tuple[int, dict]]:
+    """(Picamera2 camera number, info) for every ribbon-cable camera. libcamera lists USB webcams too;
+    those are left to WebcamSource. Raises CameraError if Picamera2 is not usable here."""
+    picamera2, _ = _load_picamera2()
+    return [(num, info) for num, info in enumerate(picamera2.global_camera_info())
+            if "usb" not in str(info.get("Id", "")).lower()]
+
+
+def on_raspberry_pi() -> bool:
+    try:
+        with open("/proc/device-tree/model") as f:
+            return "raspberry pi" in f.read().lower()
+    except OSError:
+        return False
+
+
+_ROTATIONS = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
+CAMERA_ROTATIONS = (0,) + tuple(_ROTATIONS)
+CAMERA_BACKENDS = ("auto", "picamera", "webcam")
+
+
+class RotatedCamera(CameraSource):
+    """Turns every frame of another source clockwise, for a camera mounted sideways or upside down.
+    Calibrate with the same rotation: a calibration only holds for the image it was made from."""
+
+    def __init__(self, source: CameraSource, degrees: int):
+        self._source = source
+        self._code = _ROTATIONS[degrees]
+
+    def read(self) -> Optional[np.ndarray]:
+        frame = self._source.read()
+        return None if frame is None else cv2.rotate(frame, self._code)
+
+    def release(self) -> None:
+        self._source.release()
+
+
+def open_camera(backend: str = "auto", index: int = 0, width: Optional[int] = None,
+                height: Optional[int] = None, rotate: int = 0) -> CameraSource:
+    """The live camera used by main.py and the tools.
+
+    "auto" takes a Raspberry Pi ribbon camera when Picamera2 finds one and the webcam otherwise, so the
+    same command works on the laptop and on the Pi. `index` is the n-th ribbon camera for "picamera",
+    and the OpenCV camera index (/dev/video<index> on Linux) for "webcam".
+    """
+    if backend not in CAMERA_BACKENDS:
+        raise CameraError("Unknown camera backend '{}' (use one of: {})".format(backend, ", ".join(CAMERA_BACKENDS)))
+    if rotate not in CAMERA_ROTATIONS:
+        raise CameraError("Camera rotation must be one of {} degrees, got {}".format(CAMERA_ROTATIONS, rotate))
+    no_pi_camera = None
+    if backend == "auto":
+        try:
+            found = list_pi_cameras()
+        except CameraError as e:
+            found, no_pi_camera = [], str(e)
+        else:
+            no_pi_camera = None if found else "no ribbon camera detected"
+        backend = "picamera" if found else "webcam"
+    if backend == "picamera":
+        source = PiCameraSource(index, width, height)
+    else:
+        try:
+            source = WebcamSource(index, width, height)
+        except CameraError as e:
+            if no_pi_camera and on_raspberry_pi():
+                raise CameraError("{}; and no Raspberry Pi camera either: {}".format(e, no_pi_camera))
+            raise
+        log.info("Camera: webcam %d", index)
+    return RotatedCamera(source, rotate) if rotate else source
 
 
 @dataclass

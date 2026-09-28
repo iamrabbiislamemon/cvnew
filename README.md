@@ -13,7 +13,7 @@ Camera -> aruco/ (detect, pose) -> products/ (marker -> product -> shelf ID) -> 
 |---|---|
 | `marker_detection_system.py` | Original detector (unchanged, reused by `aruco/detector.py`) |
 | `aruco/` | `detector.py` structured detections, `pose_estimator.py` solvePnP pose, `calibration.py` chessboard calibration, `perception.py` camera + overlay facade |
-| `camera/camera_source.py` | `CameraSource` interface, `WebcamSource`, `SyntheticCameraSource` (add a Pi camera here later) |
+| `camera/camera_source.py` | `CameraSource` interface, `WebcamSource`, `PiCameraSource` (Raspberry Pi camera), `SyntheticCameraSource`; `open_camera()` picks the live one |
 | `config/locations.json` | Single source of truth: marker types (dictionary, ID range, physical size), products, shelves, room map |
 | `config/loader.py` | Loads and validates the config |
 | `products/`, `shelves/` | Product and shelf lookups |
@@ -26,6 +26,8 @@ Camera -> aruco/ (detect, pose) -> products/ (marker -> product -> shelf ID) -> 
 | `tools/verify_markers.py` | Checks that generated PNGs (or a PDF) are detected by the project's detector |
 
 ### Running
+
+**Raspberry Pi 5:** see [README_PI.md](README_PI.md) for copying the project to the Pi, the one-time `pi_setup.sh`, and the Pi camera.
 
 ```bash
 pip install -r requirements.txt                       # OpenCV 4.7+ and NumPy

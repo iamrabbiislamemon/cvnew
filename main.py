@@ -7,6 +7,9 @@
   python main.py --calibrate --square-cm 2.5   # capture chessboard views and save camera calibration
   python main.py --show-map                 # print the room map and the planned path per product
 
+The live camera is the laptop webcam, or on a Raspberry Pi the ribbon camera (see README_PI.md);
+--camera-backend auto picks whichever is there.
+
 Robot movement is simulated. The webcam only supplies marker detections; it does not localise the robot.
 """
 import argparse
@@ -15,9 +18,10 @@ import sys
 
 from aruco.calibration import (DEFAULT_CALIBRATION_PATH, CalibrationError, load_if_available,
                                run_interactive_capture)
-from aruco.perception import Perception, UserAbort
+from aruco.perception import Perception, UserAbort, display_available
 from aruco.pose_estimator import PoseEstimator
-from camera.camera_source import CameraError, SimulatedWorldCamera, WebcamSource, build_world_markers
+from camera.camera_source import (CAMERA_BACKENDS, CAMERA_ROTATIONS, CameraError, SimulatedWorldCamera,
+                                  build_world_markers, open_camera)
 from config.loader import DEFAULT_CONFIG_PATH, ConfigError, WarehouseConfig, load_config
 from navigation.path_planner import PathPlanner
 from robot.robot_controller import SimulatedRobot
@@ -36,9 +40,17 @@ def parse_args():
     mode.add_argument("--show-map", action="store_true", help="print the room map and planned paths, then exit")
     p.add_argument("--config", default=DEFAULT_CONFIG_PATH)
     p.add_argument("--calibration-file", default=DEFAULT_CALIBRATION_PATH)
-    p.add_argument("--camera", type=int, default=0, help="webcam index")
-    p.add_argument("--width", type=int, help="request this capture width (must match the calibration)")
-    p.add_argument("--height", type=int, help="request this capture height")
+    p.add_argument("--camera", type=int, default=0,
+                   help="webcam index (/dev/videoN on Linux), or the Nth Raspberry Pi ribbon camera (default 0)")
+    p.add_argument("--camera-backend", choices=CAMERA_BACKENDS, default="auto",
+                   help="picamera = Raspberry Pi ribbon camera (Picamera2), webcam = laptop/USB camera (OpenCV), "
+                        "auto = picamera if one is connected, else webcam (default)")
+    p.add_argument("--rotate", type=int, choices=CAMERA_ROTATIONS, default=0,
+                   help="turn every frame clockwise by this many degrees, for a camera mounted sideways or "
+                        "upside down (calibrate with the same value)")
+    p.add_argument("--width", type=int, help="request this capture width (must match the calibration; "
+                                             "Pi camera default 1280)")
+    p.add_argument("--height", type=int, help="request this capture height (Pi camera default 720)")
     p.add_argument("--synthetic", action="store_true", help="use rendered marker frames instead of a webcam")
     p.add_argument("--no-display", action="store_true", help="no preview window")
     p.add_argument("--board", default="7x6", help="chessboard INNER corners, COLSxROWS (default 7x6)")
@@ -61,6 +73,11 @@ def synthetic_camera(config: WarehouseConfig, product_id: int) -> SimulatedWorld
     if config.products.get_by_marker(product_id) is None:
         raise ConfigError("Unknown product {}".format(product_id))
     return SimulatedWorldCamera(build_world_markers(config, product_id))
+
+
+def live_camera(args):
+    """The real camera: laptop/USB webcam, or the Raspberry Pi ribbon camera (--camera-backend)."""
+    return open_camera(args.camera_backend, args.camera, args.width, args.height, args.rotate)
 
 
 def ask_product(config: WarehouseConfig):
@@ -107,8 +124,11 @@ def run_pick(args, config: WarehouseConfig, product=None) -> int:
     else:
         log.info("Camera calibrated (%dx%d, RMS %.2f px)", *calibration.image_size, calibration.rms_error_px)
 
-    camera = synthetic_camera(config, product.marker_id) if args.synthetic \
-        else WebcamSource(args.camera, args.width, args.height)
+    if not (args.synthetic or args.no_display or display_available()):
+        log.info("No screen found (running over SSH?): continuing without the preview window. "
+                 "Ctrl+C stops the run.")
+        args.no_display = True
+    camera = synthetic_camera(config, product.marker_id) if args.synthetic else live_camera(args)
 
     def label(det):
         """Overlay text. A marker outside the configured ID ranges is not ours: say so rather than
@@ -182,7 +202,11 @@ def run_calibrate(args) -> int:
     except ValueError:
         print("--board must look like 7x6")
         return 2
-    camera = WebcamSource(args.camera, args.width, args.height)
+    if not display_available():
+        print("Calibration needs a screen to show the chessboard view: run it in a terminal on the Pi "
+              "desktop (monitor or VNC), not over plain SSH.")
+        return 2
+    camera = live_camera(args)
     try:
         return 0 if run_interactive_capture(camera, (cols, rows), args.square_cm, args.calibration_file) else 1
     except CalibrationError as e:

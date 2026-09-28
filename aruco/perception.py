@@ -3,6 +3,8 @@
 This is the only object the robot/state-machine layers use to "see". They never touch OpenCV.
 """
 import logging
+import os
+import sys
 from dataclasses import dataclass, replace
 from typing import Callable, List, Optional
 
@@ -21,6 +23,14 @@ MAX_CONSECUTIVE_READ_FAILURES = 30
 
 class UserAbort(Exception):
     """Raised when the operator presses Q/ESC in the preview window."""
+
+
+def display_available() -> bool:
+    """False on Linux without a desktop session (e.g. the Pi over SSH), where cv2.imshow would abort the
+    whole process instead of raising. Windows and macOS always have a screen."""
+    if not sys.platform.startswith("linux"):
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
 @dataclass
